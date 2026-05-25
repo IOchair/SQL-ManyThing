@@ -4,6 +4,8 @@
 
 SQL-ManyThing builds a FTS5 trigram index of your entire codebase, adds optional symbol/graph enrichment, and records every query so agents get smarter with each session.
 
+> 🇨🇳 [中文版](README.zh-CN.md)
+
 ---
 
 ## The Shock Test
