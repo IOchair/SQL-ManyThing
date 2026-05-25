@@ -1,0 +1,15 @@
+# Binary archives — license-sharing requirement
+# cymbal binaries are MIT-licensed (github.com/1broseidon/cymbal).
+# To comply with license redistribution terms, binaries are NOT committed.
+# Users install via GitHub releases; see references/phase2/enrich-cymbal.md.
+assets/bin/cymbal_v0.13.1/*.zip
+assets/bin/cymbal_v0.13.1/*.tar.gz
+assets/bin/cymbal_v0.13.1/linux/cymbal
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Internal tracking — not for publication
+TODO.md

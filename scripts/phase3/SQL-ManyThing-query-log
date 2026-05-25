@@ -1,0 +1,7 @@
+#!/bin/sh
+# SQL-ManyThing query log command shim.
+# Install with:
+#   cp scripts/phase3/SQL-ManyThing-query-log ~/.local/bin/SQL-ManyThing-query-log
+#   chmod +x ~/.local/bin/SQL-ManyThing-query-log
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$SCRIPT_DIR/manything_query_log.py" "$@"
