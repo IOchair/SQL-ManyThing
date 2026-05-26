@@ -6,12 +6,15 @@ Usage:
   # Git mode (git ls-files, respects .gitignore):
   python3 manything_build_db.py /path/to/target --git [--ext ...]
 
+  # Force full rebuild (drops and recreates all tables):
+  python3 manything_build_db.py /path/to/target --rebuild
+
 Creates .srcidx/source.db with FTS5 trigram index of file contents.
 Phase 1 only — no symbol enrich. Run Phase 2 scripts separately.
 
-Full rebuild each run (DROP + CREATE). Fast enough for all use cases
-(sub-minute for typical projects; ~85 min for Unreal-level scale).
-Phase 2 scripts handle all symbol enrich — no incremental logic needed.
+Incremental mode (default): compares content_hash (SHA-256) for each file
+and only updates changed/new files, removes deleted files. First run or
+--rebuild does a full build. Subsequent runs skip unchanged files.
 """
 
 import sqlite3
@@ -21,6 +24,7 @@ import sys
 import argparse
 import fnmatch
 import subprocess
+import hashlib
 
 DEFAULT_EXTS = {
     ".h", ".cpp", ".cs", ".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".java",
@@ -170,58 +174,180 @@ def apply_path_profile(files: list[str], profile: str | None) -> list[str]:
     return [f for f in files if profile_accepts(f, profile)]
 
 
-def build_db(target: str, exts: set, db: str, files: list[str]) -> int:
-    """Phase 1: FTS5 trigram content index from a pre-computed file list."""
-    conn = sqlite3.connect(db)
+def _init_schema(conn: sqlite3.Connection, *, rebuild: bool = False) -> None:
+    """Create or migrate the database schema.
+
+    On rebuild, drops all tables and recreates from scratch.
+    On incremental, creates tables if missing and adds content_hash column.
+    """
     c = conn.cursor()
+    if rebuild:
+        c.executescript("""
+            DROP TABLE IF EXISTS file_enrich;
+            DROP TABLE IF EXISTS files_fts;
+            DROP TABLE IF EXISTS files;
+        """)
+
     c.executescript("""
-        DROP TABLE IF EXISTS file_enrich;
-        DROP TABLE IF EXISTS files;
-        DROP TABLE IF EXISTS files_fts;
-        CREATE TABLE files (
+        CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
             path TEXT UNIQUE,
             ext TEXT,
             size INTEGER,
             mtime TEXT,
-            content TEXT
+            content TEXT,
+            content_hash TEXT
         );
-        CREATE VIRTUAL TABLE files_fts
-            USING fts5(path, content, tokenize='trigram');
         CREATE TABLE IF NOT EXISTS file_enrich (
-            file_id INTEGER PRIMARY KEY REFERENCES files(id),
+            file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
             file_key TEXT NOT NULL,
             symbols TEXT,
             enriched_at TEXT DEFAULT (datetime('now'))
         );
     """)
-    total = 0
+
+    # Migrate: add content_hash column if missing (old databases)
+    cols = [row[1] for row in c.execute("PRAGMA table_info(files)").fetchall()]
+    if "content_hash" not in cols:
+        c.execute("ALTER TABLE files ADD COLUMN content_hash TEXT")
+
+    # Create FTS5 with content-table mode if not exists
+    fts_exists = c.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_fts'"
+    ).fetchone()
+    if not fts_exists:
+        c.executescript("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS files_fts
+                USING fts5(path, content, content=files, content_rowid=id, tokenize='trigram');
+            CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+                INSERT INTO files_fts(rowid, path, content)
+                VALUES (new.id, new.path, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, path, content)
+                VALUES ('delete', old.id, old.path, old.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, path, content)
+                VALUES ('delete', old.id, old.path, old.content);
+                INSERT INTO files_fts(rowid, path, content)
+                VALUES (new.id, new.path, new.content);
+            END;
+        """)
+
+    conn.commit()
+
+
+def build_db(target: str, exts: set, db: str, files: list[str], *,
+             rebuild: bool = False) -> dict[str, int]:
+    """Phase 1: FTS5 trigram content index with incremental update.
+
+    Returns dict with keys: added, updated, removed, skipped, total.
+    On rebuild or first run, all files are treated as new (added).
+    """
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    _init_schema(conn, rebuild=rebuild)
+    c = conn.cursor()
+
+    # Build set of disk paths (filtered by extension)
+    disk_files: dict[str, tuple[str, int, str]] = {}  # relpath → (ext, size, mtime_str)
     for relpath in files:
         ext = os.path.splitext(relpath)[1].lower()
         if ext not in exts:
             continue
         fpath = os.path.join(target, relpath)
         try:
-            with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read()
-        except Exception:
-            continue
-        try:
             st = os.stat(fpath)
-        except Exception:
+        except OSError:
             continue
-        c.execute(
-            "INSERT OR REPLACE INTO files (path, ext, size, mtime, content) VALUES (?, ?, ?, ?, ?)",
-            (relpath, ext, st.st_size, str(int(st.st_mtime)), content),
-        )
-        c.execute(
-            "INSERT OR REPLACE INTO files_fts (rowid, path, content) VALUES (?, ?, ?)",
-            (c.lastrowid, relpath, content),
-        )
-        total += 1
+        disk_files[relpath] = (ext, st.st_size, str(int(st.st_mtime)))
+
+    # Get existing file paths and hashes from database
+    existing = {}
+    for row in c.execute("SELECT id, path, content_hash, mtime FROM files"):
+        existing[row[1]] = (row[0], row[2], row[3])
+
+    added = 0
+    updated = 0
+    removed = 0
+    skipped = 0
+    commit_batch = 0
+
+    for relpath, (ext, size, mtime_str) in disk_files.items():
+        fpath = os.path.join(target, relpath)
+
+        if relpath in existing:
+            existing_id, old_hash, old_mtime = existing[relpath]
+            # Quick check: if mtime unchanged, skip entirely (no file read)
+            if old_mtime == mtime_str and old_hash:
+                skipped += 1
+                del existing[relpath]
+                continue
+
+            # Mtime changed — read file and compare hash
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except Exception:
+                del existing[relpath]
+                continue
+
+            new_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+            if new_hash == old_hash:
+                # Content unchanged, just update mtime
+                c.execute(
+                    "UPDATE files SET mtime=?, size=? WHERE id=?",
+                    (mtime_str, size, existing_id),
+                )
+                skipped += 1
+                del existing[relpath]
+                commit_batch += 1
+                continue
+
+            # Content changed
+            c.execute(
+                "UPDATE files SET ext=?, size=?, mtime=?, content=?, content_hash=? WHERE id=?",
+                (ext, size, mtime_str, content, new_hash, existing_id),
+            )
+            updated += 1
+            del existing[relpath]
+            commit_batch += 1
+        else:
+            # New file
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except Exception:
+                continue
+
+            new_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+            c.execute(
+                "INSERT INTO files (path, ext, size, mtime, content, content_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (relpath, ext, size, mtime_str, content, new_hash),
+            )
+            added += 1
+            commit_batch += 1
+
+        if commit_batch >= 500:
+            conn.commit()
+            commit_batch = 0
+
+    # Remove files that exist in DB but not on disk
+    for relpath in list(existing.keys()):
+        file_id = existing[relpath][0]
+        c.execute("DELETE FROM file_enrich WHERE file_id=?", (file_id,))
+        c.execute("DELETE FROM files WHERE id=?", (file_id,))
+        removed += 1
+
     conn.commit()
+    total = added + updated + skipped
     conn.close()
-    return total
+    return {"added": added, "updated": updated, "removed": removed,
+            "skipped": skipped, "total": total}
 
 
 def main():
@@ -245,6 +371,11 @@ def main():
     parser.add_argument(
         "--gitignore",
         help="Enumerate with os.walk filtered by the specified .gitignore file (no built-in skip rules)",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Force full rebuild (DROP + CREATE all tables)",
     )
     args = parser.parse_args()
 
@@ -270,6 +401,7 @@ def main():
             sys.exit(1)
         method = f"os.walk + gitignore ({gitignore_file})"
         files = walk_files_with_gitignore(target, gitignore_file)
+        print(f"files found by {method}: {len(files)}")
     elif args.git:
         method = "git ls-files"
         files = list_files_via_git(target)
@@ -291,12 +423,18 @@ def main():
     print(f"Method: {method}")
     print(f"Exts:   {', '.join(sorted(exts))}")
     print(f"DB:     {db}")
+    if args.rebuild:
+        print(f"Mode:   FULL REBUILD")
+    else:
+        print(f"Mode:   incremental (use --rebuild for full)")
     print(f"Files enumerated: {len(files)}")
     t0 = time.time()
-    count = build_db(target, exts, db, files)
+    result = build_db(target, exts, db, files, rebuild=args.rebuild)
     elapsed = time.time() - t0
     db_size = os.path.getsize(db)
-    print(f"Indexed: {count} files in {elapsed:.1f}s")
+    print(f"Added: {result['added']}, Updated: {result['updated']}, "
+          f"Removed: {result['removed']}, Skipped: {result['skipped']}")
+    print(f"Total: {result['total']} files in {elapsed:.1f}s")
     print(f"DB size: {db_size} bytes ({db_size/1024/1024:.1f} MB)")
 
 

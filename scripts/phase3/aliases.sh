@@ -17,3 +17,5 @@
 
 # --- Active projects ---
 # (add via: echo 'MANYTHING_<project>="<path>"' >> aliases.sh)
+
+MANYTHING_unreal="/home/yanwei/Documents/myproj/UnrealEngine-release/Engine"
