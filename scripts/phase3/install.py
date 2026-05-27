@@ -24,6 +24,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
 WRAPPER_SRC = SCRIPT_DIR / "sqlite3_wrapper.py"
 QUERY_LOG_CLI = SCRIPT_DIR / "manything_query_log.py"
+WINDOWS_SQLITE3_SRC = PROJECT_ROOT / "external" / "windows" / "sqlite3" / "sqlite3.exe"
 
 
 def default_prefix() -> Path:
@@ -65,11 +66,16 @@ def do_install(prefix: Path, dry_run: bool = False) -> int:
         if not src.exists():
             print(f"Error: {src} not found. Run from SQL-ManyThing root.", file=sys.stderr)
             return 1
+    if system == "Windows" and not WINDOWS_SQLITE3_SRC.exists():
+        print(f"Error: {WINDOWS_SQLITE3_SRC} not found. Run from SQL-ManyThing root.", file=sys.stderr)
+        return 1
 
     if dry_run:
         print("SQL-ManyThing Phase 3 — dry run")
         print(f"Would install to: {prefix}")
         print(f"  {prefix / 'sqlite3'}  (from {WRAPPER_SRC})")
+        if system == "Windows":
+            print(f"  {prefix / 'sqlite3-real.exe'}  (from {WINDOWS_SQLITE3_SRC})")
         print(f"  {prefix / 'SQL-ManyThing-query-log'}  (from {QUERY_LOG_CLI})")
         print("Would initialize: query_log.db")
         print(f"PATH recommendation: add {prefix} to your PATH")
@@ -83,6 +89,9 @@ def do_install(prefix: Path, dry_run: bool = False) -> int:
     if system != "Windows":
         _make_executable(wrapper_dest)
     else:
+        real_sqlite_dest = prefix / "sqlite3-real.exe"
+        shutil.copy2(str(WINDOWS_SQLITE3_SRC), str(real_sqlite_dest))
+        print(f"Installed: {real_sqlite_dest}")
         # On Windows, create a .cmd wrapper
         cmd_path = _write_cmd_wrapper(wrapper_dest, wrapper_dest)
         print(f"Installed: {cmd_path} (.cmd wrapper)")
@@ -146,7 +155,7 @@ def do_install(prefix: Path, dry_run: bool = False) -> int:
 def do_uninstall(prefix: Path) -> int:
     print("Uninstalling SQL-ManyThing Phase 3...")
     removed = 0
-    for name in ["sqlite3", "sqlite3.cmd", "SQL-ManyThing-query-log"]:
+    for name in ["sqlite3", "sqlite3.cmd", "sqlite3-real.exe", "SQL-ManyThing-query-log"]:
         target = prefix / name
         if target.exists():
             target.unlink()
