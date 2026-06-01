@@ -19,10 +19,14 @@ Agents should keep query-time work in SQL. Do not switch between generic shell s
 ```text
 scripts/
 ├── phase1/manything_build_db.py
-├── phase2/enrich_cymbal.py
-├── phase2/enrich_graphify.py
-├── phase2/enrich_java_build.py
-├── phase2/uht_enrich.py
+├── phase2/enrich_depth_segments.py     # universal: brace/indent segments
+├── phase2/enrich_file_refs.py          # universal: import/require/include extraction
+├── phase2/flatten_file_deps.py         # universal: transitive dependency tree
+├── phase2/create_enriched_view.py      # universal: v_enriched wide VIEW
+├── phase2/enrich_cymbal.py             # optional: cymbal symbol enrich
+├── phase2/enrich_graphify.py           # optional: graphify AST + doc enrich
+├── phase2/enrich_java_build.py         # optional: Java build enrich
+├── phase2/uht_enrich.py                # optional: Unreal UHT enrich
 ├── phase3/manything_query_log.py
 ├── phase3/sqlite3_wrapper.sh
 ├── phase3/SQL-ManyThing-query-log
@@ -145,6 +149,36 @@ sqlite3 /mnt/d/Path/To/Engine/.srcidx/source.db "SELECT COUNT(*) FROM files"
 
 ## Phase 2 Enrichment
 
+### Universal Phase 2 (language-agnostic, no external tool deps)
+
+Depth/indent segments — pre-index brace-depth or indent-level blocks:
+
+```bash
+python3 scripts/phase2/enrich_depth_segments.py /path/to/project
+```
+
+File-level import refs — extract import/require/include across 10 languages:
+
+```bash
+python3 scripts/phase2/enrich_file_refs.py /path/to/project
+```
+
+Transitive dependency flattening — upstream + downstream trees:
+
+```bash
+python3 scripts/phase2/flatten_file_deps.py /path/to/project
+```
+
+v_enriched wide VIEW — denormalized query surface:
+
+```bash
+python3 scripts/phase2/create_enriched_view.py /path/to/project
+```
+
+Run order: depth_segments → file_refs → flatten_deps → view. The VIEW LEFT JOINs all three — missing refs or segments produce rows with NULL columns rather than errors.
+
+### Optional enrichment (tool-specific)
+
 cymbal symbols:
 
 ```bash
@@ -173,7 +207,7 @@ python3 scripts/phase2/uht_enrich.py \
   --batch 500
 ```
 
-For installed Unreal Engine, run UHT enrich as the primary Phase 2 path. Do not use cymbal/graphify as the main Unreal reflection strategy.
+For installed Unreal Engine, run UHT enrich as the primary optional Phase 2 path. Do not use cymbal/graphify as the main Unreal reflection strategy.
 
 ## Query-Time Rules for Agents
 
@@ -253,6 +287,10 @@ Syntax check:
 ```bash
 python3 -m py_compile \
   scripts/phase1/manything_build_db.py \
+  scripts/phase2/enrich_depth_segments.py \
+  scripts/phase2/enrich_file_refs.py \
+  scripts/phase2/flatten_file_deps.py \
+  scripts/phase2/create_enriched_view.py \
   scripts/phase2/enrich_cymbal.py \
   scripts/phase2/enrich_graphify.py \
   scripts/phase2/enrich_java_build.py \
