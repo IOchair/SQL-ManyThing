@@ -81,6 +81,9 @@ LANG_PATTERNS = {
     '.scala': [RE_SCALA_IMPORT],
     '.kt':   [RE_JAVA_IMPORT],  # Kotlin uses Java-style imports
     '.kts':  [RE_JAVA_IMPORT],
+    '.usf':  [RE_C_INCLUDE],   # UE shader files use #include
+    '.ush':  [RE_C_INCLUDE],   # UE shader headers use #include
+    '.hlsl': [RE_C_INCLUDE],   # HLSL uses #include
 }
 
 

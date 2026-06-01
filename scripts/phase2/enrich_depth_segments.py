@@ -40,6 +40,7 @@ BRACE_EXTS = {
     ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh",
     ".cs", ".kt", ".kts", ".scala", ".swift",
     ".groovy", ".clj", ".cljs", ".edn",
+    ".usf", ".ush", ".hlsl",  # UE shaders (C-style braces)
 }
 INDENT_EXTS = {
     ".py", ".pyw",

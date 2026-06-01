@@ -16,6 +16,7 @@ references/
 │   ├── enrich-covercheck-workflow.md
 │   ├── debug-cymbal-outline-empty.md
 │   ├── graphify-enrich.md              # deprecated compatibility note
+│   ├── java-import-resolver.md         # Java target_file_id=NULL design rationale
 │   ├── perf-optimization.md            # SQL round-trip elimination patterns
 │   └── ue-uht-generated-files.md
 ├── phase3/
@@ -39,7 +40,8 @@ references/
     ├── installed-build-indexing.md
     ├── unreal-installed-indexing-profiles.md
     ├── ue5-installed-engine.gitignore
-    └── ue58-full-phase123-run.md
+    ├── ue58-full-phase123-run.md
+    └── phase2-overload-test.md
 ```
 
 ## Organization Rules

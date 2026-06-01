@@ -13,3 +13,6 @@ __pycache__/
 
 # Internal tracking — not for publication
 TODO.md
+
+# Build artifacts
+.srcidx/

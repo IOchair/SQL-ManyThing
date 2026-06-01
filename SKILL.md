@@ -242,6 +242,47 @@ v_enriched is a VIEW computed from `files` + `enrich_depth_segments` + `enrich_f
 
 **Key rule**: v_enriched gives `block_content` for free — do NOT fall back to `instr(content, ...)` + `substr(content, offset, length)` when v_enriched is available. The VIEW already has exact boundaries. Manual anchor hunting is only acceptable when v_enriched is not built.
 
+**block_content truncation escape hatch (very large blocks)**: v_enriched's `block_content` may be truncated when function bodies exceed its column width. Detect this: if `length(block_content)` is suspiciously short for the (end_offset - start_offset) range, or if a function clearly extends beyond what `block_content` returned, retrieve the full body from `files.content` using v_enriched's exact offsets — never instr-based guessing:
+
+```sql
+SELECT substr(f.content, ve.start_offset, ve.end_offset - ve.start_offset) AS full_body
+FROM v_enriched ve
+JOIN files f ON f.id = ve.file_id
+WHERE ve.file_path = '<target_path>'
+  AND ve.depth_level = 1
+  AND ve.block_content LIKE '%<anchor_keyword>%';
+```
+
+This is NOT a violation of the anchor-hunting rule. The difference: v_enriched provides verified `start_offset`/`end_offset` from the depth-segment indexing pass; instr requires scanning content for a text anchor at query-time. Offset-based extraction from v_enriched boundaries is the correct A* g=1 escape hatch for oversized blocks.
+
+**Zoom out for broader context (don't guess offsets):** When a single block is too narrow, expand by lowering `depth_level` — v_enriched already knows the nesting hierarchy. Never fall back to blind `substr(content, <magic_number>, N)`:
+
+```sql
+-- Step 1: browse the file's block map (depth=0 = file-level envelope)
+SELECT depth_level, start_offset, end_offset,
+       substr(block_content, 1, 120) AS preview
+FROM v_enriched
+WHERE file_path = '<path>'
+ORDER BY start_offset;
+
+-- Step 2: get the enclosing scope (e.g. class body around a method)
+SELECT block_content FROM v_enriched
+WHERE file_path = '<path>'
+  AND depth_level = <target_depth - 1>
+  AND start_offset <= <target_start_offset>
+  AND end_offset >= <target_end_offset>;
+
+-- Step 3 (rare): if you genuinely need raw bytes between blocks,
+-- use v_enriched offsets — never guess:
+SELECT substr(f.content, ve.start_offset, ve.end_offset - ve.start_offset)
+FROM v_enriched ve JOIN files f ON f.id = ve.file_id
+WHERE ve.file_path = '<path>'
+  AND ve.depth_level = <depth>
+  AND ve.start_offset = <known_offset>;
+```
+
+Key principle: the file is fully covered by depth segments — every byte belongs to some block. If `block_content` feels too small, the fix is lowering `depth_level`, not abandoning v_enriched for manual offset guessing. Manual `substr(content, 36637, 4000)` is an anti-pattern: the number 36637 appears nowhere in the query plan and was arrived at by guesswork.
+
 ## Operator 3: Import & Dependency Probe
 
 Use for "who imports X" or "what does X depend on" questions.
@@ -309,6 +350,7 @@ Java modules: `scripts/phase2/enrich_java_build.py`
 | Universal Phase 2: file-level import refs | `scripts/phase2/enrich_file_refs.py` |
 | Universal Phase 2: transitive dep flattening | `scripts/phase2/flatten_file_deps.py` |
 | Universal Phase 2: v_enriched wide VIEW | `scripts/phase2/create_enriched_view.py` |
+| Universal Phase 2: Windows BAT template | `scripts/phase2/run_phase2_universal_windows.bat` |
 | Phase 2 performance patterns | `references/phase2/perf-optimization.md` |
 | Symbol enrichment (cymbal) | `references/phase2/enrich-cymbal.md` |
 | Graph enrichment (graphify) | `references/phase2/enrich-graphify.md` |
@@ -324,6 +366,7 @@ Java modules: `scripts/phase2/enrich_java_build.py`
 | Unreal installed-build indexing | `references/unreal/installed-build-indexing.md` |
 | Unreal indexing profiles | `references/unreal/unreal-installed-indexing-profiles.md` |
 | UE 5.8 full run | `references/unreal/ue58-full-phase123-run.md` |
+| Phase 2 overload test (UE) | `references/unreal/phase2-overload-test.md` |
 | Unreal UHT DB verification | `scripts/verify/verify_ue_uht_sql.py` |
 | Third-party licensing audit | `references/third-party-attribution.md` |
 | Open-source attribution notices | `THIRD_PARTY_NOTICES.md` |
@@ -415,6 +458,8 @@ Anti-patterns:
 7. Recursively grepping Hermes home to find project aliases. Use `~/.hermes/manything/aliases.sh`.
 8. Listing every source path for an overview. Group by top-level path first, drill into a subset.
 9. Switching from SQL to code_search/code_extract mid-session. The index has FTS5 + v_enriched for everything provenance the project needs. Reaching for generic search tools is a signal you forgot SQL covers it — rephrase the question as a FTS5 MATCH and a v_enriched block look-up.
+10. Writing `.bat` files from WSL with LF line endings or non-ASCII characters (em dashes, Unicode). Windows `cmd.exe` requires CRLF + pure ASCII. Always run `unix2dos` on `.bat` files authored in WSL. Avoid `%s` in inline Python strings inside `.bat` — `cmd.exe` interprets `%s` as variable expansion; use `%%s` or keep verification in separate sqlite3 calls.
+11. Falling back to blind `substr(content, <magic_number>, <magic_number>)` when v_enriched found the target but you want «more context». The file is fully depth-segmented — every byte belongs to some block. If a single block feels too narrow, query `depth_level - 1` for the enclosing scope, or browse adjacent blocks by `start_offset`. Never fabricate a byte offset from thin air; always derive it from a v_enriched `start_offset`/`end_offset` column.
 
 ## Verification Checklist
 
