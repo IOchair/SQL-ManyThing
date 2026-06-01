@@ -95,6 +95,59 @@ Top extensions:
 .hlsl        6
 ```
 
+## Phase 2 — Universal (overload test)
+
+Ran universal Phase 2 (language-agnostic, no external tool deps) on the 89,203-file UE 5.8 engine index.
+
+Scripts patched for UE shader coverage:
+- `enrich_depth_segments.py`: added `.usf`, `.ush`, `.hlsl` → BRACE_EXTS (C-style braces)
+- `enrich_file_refs.py`: added `.usf`, `.ush`, `.hlsl` → LANG_PATTERNS (RE_C_INCLUDE)
+
+Run via Windows Python from `D:\...\Engine\.srcidx\sql_manything_run\`:
+
+```bat
+run_phase2_universal_windows.bat
+```
+
+Template: `scripts/phase2/run_phase2_universal_windows.bat`
+
+BAT must be CRLF + pure ASCII (no em dashes, no Unicode) — authored in WSL, converted with `unix2dos`.
+
+Results:
+
+```text
+enrich_depth_segments: 5,242,711 rows
+enrich_file_refs:        550,253 rows
+enrich_file_deps:      993 upstream, 993 downstream (5 rounds)
+v_enriched:          5,242,711 rows (5,242,711 segments, 550,253 refs)
+```
+
+DB growth: 3,038 MB → 3,432 MB (+394 MB)
+
+Depth distribution (peak at depth=2, exponential decay after depth=5):
+
+```text
+depth 0:   618,172
+depth 1: 1,378,220
+depth 2: 1,413,300
+depth 3:   894,365
+depth 4:   488,937
+depth 5:   241,130
+depth 6:   114,407
+depth 7:    53,908
+depth 8:    23,540
+depth 9:     9,618
+depth 10+:   7,020
+```
+
+UE shader coverage validated:
+
+| ext | Phase 1 files | depth segments | #include refs |
+|-----|--------------|----------------|---------------|
+| .ush | 789 | 47,564 | 1,415 |
+| .usf | 851 | 35,234 | 3,739 |
+| .hlsl | 6 | 87 | 4 |
+
 ## Phase 2 — UHT Only
 
 For installed Unreal Engine builds, run only UHT enrich for Phase 2. Do not run cymbal/graphify as the primary enrich path for Unreal.
