@@ -572,10 +572,7 @@ ORDER BY f.path, r.line_num;
 
 Pre-indexed architectural summaries built from A* traversal. Load with `skill_view(name="sql-manything", file_path="references/<name>.md")` before querying a known domain — they cut discovery cost to near-zero.
 
-Key references:
-- `references/fresh-agent-failure-transcripts.md` — two real sessions where pre-v5.4.0 document structure caused Frame-skipping and budget waste (43 queries, 23 queries). Evidence for why reading order = execution order.
-- `references/trace-reversal-case-study.md` — how the original `:trace` prohibition was wrong: the wrapper supported it all along, but the SKILL.md was tested against the wrong sqlite3 binary. Lesson: verify doc claims against implementation.
-- See `references/INDEX.md` for full catalog.
+See `references/INDEX.md` for full catalog.
 
 ## §8 Common Violations (Checklist)
 
