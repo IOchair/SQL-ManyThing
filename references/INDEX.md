@@ -25,9 +25,10 @@ references/
 │   └── importer-parsing.md
 ├── platforms/
 │   └── wsl-windows-phase123-smoke.md
-├── query/
+- query/
 │   ├── library-analysis-js-ts.md       # JS/TS library discovery pattern
-│   └── ue-gas-attribute-analysis.md    # UE GAS AttributeSet BP init diagnosis
+│   ├── ue-gas-attribute-analysis.md    # UE GAS AttributeSet BP init diagnosis
+│   └── ue-substrate-toon-trace.md      # UE Substrate toon shader 3-file trace
 ├── design/
 │   └── sql-is-many-things.md           # Design rationale: A*, SQLite, bounded extraction
 ├── phase2-design.md                    # Full-scan design rationale, dirty.db pattern
@@ -36,6 +37,7 @@ references/
 ├── public-examples.md                  # Public example DBs
 ├── db-maintenance.md                   # DB maintenance guide
 ├── agent-query-loop-lessons.md         # Agent query-loop dogfooding
+├── old-format-cleanup.md               # Pre-v5.4.0 table remnant cleanup
 └── unreal/
     ├── installed-build-indexing.md
     ├── unreal-installed-indexing-profiles.md

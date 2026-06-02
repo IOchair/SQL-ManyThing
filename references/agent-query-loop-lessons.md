@@ -104,7 +104,7 @@ Result: 10 queries → 4 queries (60% reduction). See `SKILL.md` "block_content 
 **Implementation:**
 - `scripts/phase2/enrich_depth_segments.py`: `ensure_schema()` adds `scope_end_offset` column; `compute_scope_end_offsets()` runs one UPDATE after all segments inserted
 - `scripts/phase2/create_enriched_view.py`: VIEW adds `scope_end_offset` + `block_content_full` columns
-- 25万 segments computed in ~1s for hermes-agent (3979 files)
+- 250K segments computed in ~1s for hermes-agent (3979 files)
 
 **Key SQL:**
 ```sql
