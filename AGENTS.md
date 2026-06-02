@@ -27,9 +27,9 @@ scripts/
 ├── phase2/enrich_graphify.py           # optional: graphify AST + doc enrich
 ├── phase2/enrich_java_build.py         # optional: Java build enrich
 ├── phase2/uht_enrich.py                # optional: Unreal UHT enrich
-├── phase3/manything_query_log.py
-├── phase3/sqlite3_wrapper.sh
-├── phase3/SQL-ManyThing-query-log
+├── phase3/install.py                    # cross-platform wrapper installer
+├── phase3/sqlite3_wrapper.py            # the wrapper itself
+├── phase3/manything_query_log.py        # query log init + import
 └── verify/verify_ue_uht_sql.py
 
 references/
@@ -42,23 +42,17 @@ references/
 
 ## Install Phase 3 Locally
 
-Run from repo root:
-
 ```bash
-python3 scripts/phase3/manything_query_log.py init
-mkdir -p ~/.local/bin
-cp scripts/phase3/sqlite3_wrapper.sh ~/.local/bin/sqlite3
-cp scripts/phase3/SQL-ManyThing-query-log ~/.local/bin/SQL-ManyThing-query-log
-chmod +x ~/.local/bin/sqlite3 ~/.local/bin/SQL-ManyThing-query-log
+python3 scripts/phase3/install.py
 ```
 
-Ensure `~/.local/bin` is before `/usr/bin`:
+This places a `sqlite3` wrapper in `~/.local/bin/` that intercepts `/manything/<project>/source.db` and `:trace`. Verify with `which sqlite3` — it should point to `~/.local/bin/sqlite3`. Ensure `~/.local/bin` is before `/usr/bin` in `PATH`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Register aliases in exactly this format:
+Register project aliases in exactly this format:
 
 ```bash
 echo 'MANYTHING_myproject="/path/to/project"' >> ~/.hermes/manything/aliases.sh
@@ -74,8 +68,7 @@ Correct verification:
 
 ```bash
 sqlite3 /manything/myproject/source.db "SELECT COUNT(*) FROM files"
-SQL-ManyThing-query-log import
-sqlite3 :trace "SELECT COUNT(*) FROM query_log"
+sqlite3 :trace "SELECT COUNT(*) FROM query_trace"
 sqlite3 :trace ".tables"
 ```
 
@@ -154,13 +147,13 @@ sqlite3 /mnt/d/Path/To/Engine/.srcidx/source.db "SELECT COUNT(*) FROM files"
 Depth/indent segments — pre-index brace-depth or indent-level blocks:
 
 ```bash
-python3 scripts/phase2/enrich_depth_segments.py /path/to/project
+python3 scripts/phase2/enrich_depth_segments.py /path/to/project --batch 500
 ```
 
 File-level import refs — extract import/require/include across 10 languages:
 
 ```bash
-python3 scripts/phase2/enrich_file_refs.py /path/to/project
+python3 scripts/phase2/enrich_file_refs.py /path/to/project --batch 500
 ```
 
 Transitive dependency flattening — upstream + downstream trees:
@@ -211,10 +204,9 @@ For installed Unreal Engine, run UHT enrich as the primary optional Phase 2 path
 
 ## Query-Time Rules for Agents
 
-Before first query:
+Before first query, check if any useful patterns are already tagged:
 
 ```bash
-SQL-ManyThing-query-log import
 sqlite3 :trace "
 WITH intent(term) AS (
   VALUES ('files'), ('ext'), ('path'), ('symbols'), ('file_enrich'),
@@ -295,6 +287,7 @@ python3 -m py_compile \
   scripts/phase2/enrich_graphify.py \
   scripts/phase2/enrich_java_build.py \
   scripts/phase2/uht_enrich.py \
+  scripts/phase3/install.py \
   scripts/phase3/manything_query_log.py \
   scripts/verify/verify_ue_uht_sql.py
 ```
