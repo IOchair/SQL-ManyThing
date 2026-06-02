@@ -34,7 +34,6 @@ references/
 ├── db-maintenance.md                   # DB maintenance guide
 ├── agent-query-loop-lessons.md         # Agent query-loop dogfooding
 ├── old-format-cleanup.md               # Pre-v5.4.0 table remnant cleanup
-├── readme-structure-principles.md       # README cognitive-gradient structure guide
 └── unreal/
     ├── installed-build-indexing.md
     ├── unreal-installed-indexing-profiles.md
