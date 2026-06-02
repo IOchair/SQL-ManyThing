@@ -2,7 +2,9 @@
 """SQL-ManyThing — Phase 2: Create v_enriched wide view.
 
 Combines files + depth_segments + file_refs into one denormalized VIEW.
-Every row = one depth_segment with pre-extracted block_content + refs.
+Every row = one depth_segment with:
+  - block_content       — the immediate segment (signature/header)
+  - block_content_full  — full enclosing scope (function/method/class body)
 
 Run after all other Phase 2 scripts:
   enrich_depth_segments.py
@@ -43,7 +45,13 @@ def create_view(target: str):
         ds.depth_level,
         ds.start_offset,
         ds.end_offset,
+        ds.scope_end_offset,
         substr(f.content, ds.start_offset + 1, ds.end_offset - ds.start_offset) AS block_content,
+        CASE WHEN ds.scope_end_offset IS NOT NULL THEN
+            substr(f.content, ds.start_offset + 1, ds.scope_end_offset - ds.start_offset)
+        ELSE
+            substr(f.content, ds.start_offset + 1, ds.end_offset - ds.start_offset)
+        END AS block_content_full,
         refs_out.refs_to,
         refs_in.refs_from
     FROM files f

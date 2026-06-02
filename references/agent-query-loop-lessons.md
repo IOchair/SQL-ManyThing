@@ -90,3 +90,34 @@ SQLite `DROP TABLE` does not shrink a database file. Full rebuild scripts should
 - UHT enrich remains the main Phase 2 path
 
 `unreal-installed-core` keeps DB size near the earlier baseline while preserving UHT coverage.
+
+## Depth segmentation causes redundant substr queries (→ scope_end_offset fix)
+
+**Problem (2026-06-02):** Agent was making 2-3x more queries than necessary when extracting function bodies. Root cause: `v_enriched.block_content` returns ONE depth segment at a time, but functions span multiple depth levels (signature at depth=N, body at N+1, N+2...). Agent saw only the header, then manually stitched deeper segments via `substr(f.content, start, end-start)` — 3-4 queries per function.
+
+Example: `PtyBridge.spawn()` — 4 queries (FTS5 → block_content header → depth verification → substr stitch). `_make_tui_argv()` — 3 queries. `_resolve_chat_argv()` — 2 queries (truncated first, continuation second).
+
+**Fix:** Added `scope_end_offset` to `enrich_depth_segments` (computed once via SQL UPDATE after segment insertion) and `block_content_full` to `v_enriched` VIEW. `scope_end_offset` = start of next segment at same-or-shallower depth (or EOF). One `block_content_full` query now returns the complete function body.
+
+Result: 10 queries → 4 queries (60% reduction). See `SKILL.md` "block_content vs block_content_full" section and the split-signature edge case.
+
+**Implementation:**
+- `scripts/phase2/enrich_depth_segments.py`: `ensure_schema()` adds `scope_end_offset` column; `compute_scope_end_offsets()` runs one UPDATE after all segments inserted
+- `scripts/phase2/create_enriched_view.py`: VIEW adds `scope_end_offset` + `block_content_full` columns
+- 250K segments computed in ~1s for hermes-agent (3979 files)
+
+**Key SQL:**
+```sql
+UPDATE enrich_depth_segments SET scope_end_offset = (
+    SELECT COALESCE(
+        MIN(ds2.start_offset),
+        (SELECT length(f.content) FROM files f WHERE f.id = enrich_depth_segments.file_id)
+    )
+    FROM enrich_depth_segments ds2
+    WHERE ds2.file_id = enrich_depth_segments.file_id
+      AND ds2.start_offset > enrich_depth_segments.start_offset
+      AND ds2.depth_level <= enrich_depth_segments.depth_level
+);
+```
+
+**Known limitation:** Python/TSX functions with multi-line signatures may split across two depth=0 segments. The PROBE finds the def-line segment (small block_content_full); the body is in the adjacent same-depth segment. Query the next depth=0 row via `start_offset > <def_line_offset>`. Affects ~10% of top-level functions.

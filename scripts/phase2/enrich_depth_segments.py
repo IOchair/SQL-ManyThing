@@ -83,6 +83,16 @@ def ensure_schema(conn: sqlite3.Connection):
             enriched_at TEXT DEFAULT (datetime('now'))
         );
     """)
+    # Phase 2.1: scope_end_offset column (added post-enrich_depth_segments).
+    # Tells v_enriched where a segment's enclosing scope ends —
+    # the start_offset of the next segment at same-or-shallower depth,
+    # or the file's content length.
+    try:
+        conn.execute(
+            f"ALTER TABLE {SEGMENTS_TABLE} ADD COLUMN scope_end_offset INTEGER"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
 
 # ── brace mode ───────────────────────────────────────────────────────
@@ -432,8 +442,41 @@ def enrich_depth(target: str, db: str, batch_size: int,
         print(f"  batch {batch_i // batch_size}: {batch_ok} files, "
               f"{len(seg_rows)} segments in {time.time() - t0:.1f}s")
 
+    # Compute scope-end offsets after all segments are inserted.
+    # Must run AFTER all files are done so cross-file joins don't race.
+    t0 = time.time()
+    compute_scope_end_offsets(conn)
+    print(f"  scope_end_offset computed in {time.time() - t0:.1f}s")
+
     conn.close()
     return inserted
+
+
+def compute_scope_end_offsets(conn: sqlite3.Connection):
+    """Compute scope_end_offset for every segment in one SQL pass.
+
+    For a segment at depth N, scope_end_offset is the start_offset of
+    the next segment at depth <= N (same or shallower), or the file's
+    content length if no such segment follows.  This gives the exact
+    byte range of the enclosing scope — e.g. for a method header at
+    depth=1, scope_end_offset = the start of the next depth<=1 segment,
+    which is the next method / class end.  v_enriched uses this to
+    produce block_content_full without stitching multiple depth rows.
+    """
+    conn.execute("""
+        UPDATE enrich_depth_segments SET scope_end_offset = (
+            SELECT COALESCE(
+                MIN(ds2.start_offset),
+                (SELECT length(f.content) FROM files f
+                 WHERE f.id = enrich_depth_segments.file_id)
+            )
+            FROM enrich_depth_segments ds2
+            WHERE ds2.file_id = enrich_depth_segments.file_id
+              AND ds2.start_offset > enrich_depth_segments.start_offset
+              AND ds2.depth_level <= enrich_depth_segments.depth_level
+        )
+    """)
+    conn.commit()
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────

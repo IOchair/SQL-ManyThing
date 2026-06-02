@@ -1,7 +1,7 @@
 ---
 name: sql-manything
-description: Use when a project has a SQL-ManyThing SQLite source index. Query code structure with A* search over FTS5, symbol enrichment, depth segments, file dependencies, graph edges, v_enriched VIEW, and bounded source extraction before falling back to slower tools.
-version: 1.2.0
+description: A* source-code search over SQL-ManyThing SQLite index. Four canonical SQL templates (DISCOVER→TRACE_DEPS→EXTRACT→EXTRACT_BLOCK) + Abstraction Frame with budget tracking. No substr guessing, no whole-file reads.
+version: 5.4.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -12,471 +12,586 @@ metadata:
 
 # SQL-ManyThing
 
-## Overview
+Indexes a source tree into a SQLite DB. Query model: Abstraction Frame → DISCOVER → EXTRACT → EXTRACT_BLOCK, with optional TRACE_DEPS for candidate disambiguation.
 
-SQL-ManyThing indexes a source tree into a SQLite DB. Query with A* discipline: FTS5 probe → `v_enriched` block extract → stop at evidence. Build-time details: `AGENTS.md`, `scripts/`, `references/`. Design philosophy: `README.md`.
+**Reading order is execution order.** Start at §0, follow steps in sequence. Do not jump to SQL templates before writing a Frame.
 
-## When to Use
+## §0 When to Use
 
-- A project has `.srcidx/source.db`.
+**Use when:**
+- A project has `.srcidx/source.db` (if not, see §1.3 to create one). Query via `/manything/<project>/source.db`.
 - The user asks for code search, tracing, implementation lookup, or architecture inspection.
-- Minimize token cost — no whole-file reads.
+- You need precise, offset-based extraction without whole-file reads.
 
-Do not use when: no index exists, task is non-code, or index is stale.
+**Do NOT use when:**
+- No index exists for the project.
+- You're looking at <100 files total — `code_search` / `code_extract` is faster.
+- The target is logs, config, markdown, or non-code text — use `search_files` / `read_file`.
+- You need a single function from a known file — `code_extract` is 1 call.
 
-## A* Search Model
+## §1 Pre-flight — Know Your DB Before You Query
 
-| A* term | Meaning |
+Before ANY query, check what tables are available. Not every project is fully enriched.
+
+### 1.1 Schema check
+
+```bash
+sqlite3 /manything/<project>/source.db "
+SELECT name FROM sqlite_master
+WHERE type='table' AND name IN ('files','files_fts','v_enriched','enrich_file_deps','enrich_file_refs','enrich_depth_segments')
+ORDER BY name;"
+```
+
+| Tables present | Capabilities |
 |---|---|
-| State space | `files` + `v_enriched` + `enrich_file_refs` + `enrich_file_deps` |
-| Goal state | bounded `block_content` that directly answers the question |
-| g(n) | cost paid: SQL queries, tool calls, tokens |
-| h(n) | remaining-cost estimate from FTS5 rank, trace reuse, depth precision |
-| Operator | one SQL query, one v_enriched extract |
-| Goal test | exact evidence obtained; stop
+| `files` + `files_fts` only | FTS5 search only. No v_enriched — skip EXTRACT/EXTRACT_BLOCK. Use `files.content` or fall back to `read_file`. |
+| + `v_enriched` | Full DISCOVER → EXTRACT → EXTRACT_BLOCK chain. |
+| + `enrich_file_deps` | TRACE_DEPS available. |
+| + `enrich_depth_segments` | `block_content_full` + `scope_end_offset` for complete body extraction. |
+| + `enrich_file_refs` (no deps) | Raw #include/import strings — query refs table directly. |
 
-## Primary Query Chain
+### 1.2 File count
+
+```bash
+sqlite3 /manything/<project>/source.db "SELECT count(*) AS file_count FROM files;"
+```
+
+| File count | Strategy |
+|---|---|
+| <10K | Fast LIKE scans OK |
+| 10K–50K | Prefer FTS5 for discovery; narrow LIKE with `file_path` |
+| >50K | FTS5 only for discovery; NEVER run unfiltered `block_content LIKE '%X%'` without `file_path` |
+
+### 1.3 Setup: Phase 1 → 2 → 3
+
+A fully enriched project goes through three phases. After Phase 1 each phase is optional — stop when you have the tables you need (§1.1).
+
+**Phase 1 — Create the index** (`references/phase1/phase1-setup.md`):
+```bash
+python3 scripts/phase1/manything_build_db.py /path/to/project
+```
+This creates `.srcidx/source.db` with `files` + `files_fts`. Enough for FTS5-only search.
+
+**Phase 2 — Enrich with structure + dependencies** (`references/phase2/enrich-covercheck-workflow.md`):
+```bash
+# Universal workflow (all languages, always applicable):
+python3 scripts/phase2/enrich_depth_segments.py /path/to/project --batch 500
+python3 scripts/phase2/enrich_file_refs.py       /path/to/project --batch 500
+python3 scripts/phase2/flatten_file_deps.py      /path/to/project
+python3 scripts/phase2/create_enriched_view.py   /path/to/project
+```
+This adds `v_enriched`, `enrich_file_deps`, `enrich_file_refs`, `enrich_depth_segments` — the full DISCOVER→EXTRACT→EXTRACT_BLOCK chain. If re-running on a previously enriched DB, see `references/old-format-cleanup.md`.
+
+Optional enrichments (not needed for most queries):
+- `enrich_cymbal.py` — symbol definitions via cymbal CLI (Python/Go/JS only; needs `cymbal` binary)
+- `enrich_graphify.py` — AST graph for Python + Markdown (does not cover TSX/JSX)
+- `enrich_java_build.py` — Java-specific
+
+On Windows, `scripts/phase2/run_phase2_universal_windows.bat` runs all 4 steps. On Linux/WSL/macOS, run the Python scripts directly as shown above.
+
+**Phase 3 — Install the sqlite3 wrapper** (enables `/manything/` paths + `:trace`):
+```bash
+# Cross-platform (Windows/Linux/macOS):
+python3 scripts/phase3/install.py
+
+# Or bash-only (Linux/WSL/macOS):
+./install.sh
+```
+This places a `sqlite3` wrapper in `~/.local/bin/` that intercepts `/manything/<project>/source.db` and `:trace`. On Windows, `install.py` also copies `sqlite3-real.exe` and creates a `.cmd` wrapper. Ensure `~/.local/bin` is before `/usr/bin` in PATH.
+
+After Phase 3, register the project:
+```bash
+echo 'MANYTHING_<project>="/path/to/project"' >> ~/.hermes/manything/aliases.sh
+```
+Then proceed with §1.1 schema check.
+
+See `references/phase3/phase3-design-rationale.md` for architecture details.
+
+### 1.4 Trace — search past queries (`:trace`)
+
+The sqlite3 wrapper logs every `/manything/` query to `~/.hermes/manything/query_log.db`. Use `:trace` as a virtual database name to search past queries — it resolves to the global query log automatically.
+
+**Search by project + keyword:**
+```bash
+sqlite3 :trace "
+SELECT id, sql_text, tag FROM query_trace
+WHERE project = '<project>'
+  AND sql_text LIKE '%<keyword>%'
+ORDER BY id DESC LIMIT 10;"
+```
+
+**Tag a useful query pattern** (agent discovers a reusable SQL shape):
+```sql
+INSERT INTO query_notes(log_id, note, tag, created_at)
+VALUES (<id>, 'brief description of the pattern', '<short_tag>', strftime('%s','now'));
+```
+
+Tagged queries accumulate over time — future agents can `SELECT * FROM query_trace WHERE tag IS NOT NULL` to discover proven patterns without repeating discovery work. This is how the system gets faster and deeper with use.
+
+## §2 Quick Start — Minimal Path (4 queries)
+
+Goal: find and extract `SubstrateToonBSDF` in UE 5.8.
+
+**Step 0 — Pre-flight** (already done: ue58 has all tables, 89K files, >50K → FTS5 only).
+
+**Step 1 — Write the Frame:**
 
 ```
--- A*: g=1 (FTS5 probe) → h=rank → extract
-SELECT f.path, f.ext, rank               -- 1. FTS5 finds candidate
-FROM files_fts JOIN files f ON f.rowid = files_fts.rowid
-WHERE files_fts MATCH '<keyword>'
-ORDER BY rank LIMIT 5;
+═══ A* BUDGET FRAME  #1 ═══
+QUERY: UE5.8 Substrate Toon BSDF — shader implementation entry point
 
--- A*: g=2 (v_enriched) → h=0 (exact block) → goal
-SELECT file_path, depth_level, block_content  -- 2. v_enriched extracts block
+LAYERS:
+  shader:     SubstrateToonBSDF.ush — BSDF eval + integrate functions
+    DISCOVER:      FTS5 MATCH 'SubstrateToonBSDF'
+    EXTRACT:       v_enriched depth≤1 structure map
+    EXTRACT_BLOCK: SubstrateEvaluateToon body → TERMINAL
+```
+
+**Step 2 — DISCOVER:**
+
+```sql
+-- [intent] find Substrate toon BSDF shader file
+-- [budget] L1-P: g=1
+SELECT f.path, rank FROM files_fts, files f
+WHERE files_fts MATCH 'SubstrateToonBSDF'
+  AND files_fts.rowid = f.id AND f.path NOT LIKE '%test%'
+ORDER BY rank LIMIT 10;
+-- → Shaders/Private/Substrate/SubstrateToonBSDF.ush (rank -9.2)
+```
+
+**Step 3 — EXTRACT (probe structure):**
+
+```sql
+-- [intent] structure map of SubstrateToonBSDF.ush
+-- [budget] L1-P: g=2
+SELECT depth_level, start_offset,
+       length(block_content) AS bytes,
+       length(block_content_full) AS full_bytes,
+       substr(block_content, 1, 100) AS preview
 FROM v_enriched
-WHERE block_content LIKE '%<keyword>%'
+WHERE file_path = 'Shaders/Private/Substrate/SubstrateToonBSDF.ush'
+  AND depth_level <= 1
 ORDER BY depth_level, start_offset;
-
--- A*: g=2 (who imports?) → h=0 (raw strings cover all langs)
-SELECT f.path, r.target_raw, r.line_num      -- 3. enrich_file_refs for imports
-FROM enrich_file_refs r JOIN files f ON f.id = r.file_id
-WHERE r.target_raw LIKE '%<ClassName>%';
+-- → depth=0: file envelope (includes, macros)
+-- → depth=1: UnpackToonCustomData, SubstrateIntegrateToon, SubstrateEvaluateToon, ...
 ```
 
-Never fall back to `instr(content,...)` + `substr(content,offset,len)` when `v_enriched.block_content` exists.
-
-## Mandatory Pre-flight
-
-Before the first query against a project in a session:
-
-```bash
-SQL-ManyThing-query-log import
-sqlite3 :trace "
-WITH intent(term) AS (
-  VALUES
-    ('<intent-keyword-1>'),
-    ('<intent-keyword-2>'),
-    ('<domain-synonym-1>'),
-    ('<likely-sql-anchor-1>')
-)
-SELECT id, project, tag, note, substr(sql_text, 1, 180) AS sql_preview
-FROM query_trace
-WHERE project='<project>'
-  AND (tag IS NOT NULL OR EXISTS (
-    SELECT 1 FROM intent WHERE lower(sql_text) LIKE '%' || lower(term) || '%'
-  ))
-ORDER BY tag IS NULL, id DESC
-LIMIT 12;"
-```
-
-Expand intent with world knowledge — e.g. "implementation overview" → `files`, `ext`, `path`, `v_enriched`, `file_refs`, `src`, `layout`.
-
-Tag useful traces:
-
-```bash
-sqlite3 :trace "
-INSERT INTO query_notes (log_id, note, tag, created_at)
-VALUES (<id>, '<when to reuse>', 'useful_pattern', strftime('%s','now'));
-"
-```
-
-Use `/manything/<project>/source.db` (virtual path, wrapper-logs queries). Verify: `sqlite3 /manything/<project>/source.db "SELECT COUNT(*) FROM files"`. `query_trace` lives in `:trace`, not in project DBs.
-
-Rules:
-- Import before querying `:trace`.
-- Reuse tagged traces when intent overlaps.
-- Fall back to FTS5 only when no useful trace exists.
-- Use virtual paths for query-time SQL; `.srcidx/...` for setup/debug only.
-- Find aliases in `~/.hermes/manything/aliases.sh` — never recursive grep.
-- At the end of a query session, run `SQL-ManyThing-query-log import` once more if you need the just-run virtual-path queries to appear in `:trace` immediately.
-
-**query_trace table absent**: Phase 3 query logging may not be set up. This diagnosis is valid only when the `:trace` command itself fails with `no such table: query_trace`:
-
-```bash
-sqlite3 :trace ".tables"
-```
-
-When this happens:
-  1. Treat it as "no useful trace exists" — skip straight to FTS5 or symbol probe.
-  2. Do not conclude the project index is broken. Phase 1 (FTS5) and Phase 2 (enrichment) are independent of Phase 3.
-  3. Proceed normally without repeating the trace query.
-
-Do **not** infer Phase 3 failure from `.tables` on `/path/to/.srcidx/source.db`; project databases are not supposed to contain `query_trace`.
-
-## Project Discovery
-
-If the user names a project but no alias exists, do not conclude the project is missing. Discover and register it.
-
-Recommended sequence:
-
-1. Inspect SQL-ManyThing aliases.
-2. Locate the project root using configured mount points or common repository directories.
-3. Confirm the root contains source files.
-4. Check for `.srcidx/source.db`.
-5. If no index exists, ask before building unless the user already authorized indexing.
-6. Register the alias.
-7. Run the mandatory pre-flight.
-
-Registration shape:
-
-```bash
-MANYTHING_<project>="<absolute_project_root>"
-```
-
-Verification shape:
-
-```bash
-sqlite3 /manything/<project>/source.db "SELECT COUNT(*) FROM files"
-```
-
-## Operator 1: FTS5 Probe
-
-FTS5 is the broad entry point — use it to discover candidate files.
+**Step 4 — EXTRACT_BLOCK (terminal):**
 
 ```sql
-SELECT f.path, f.ext, rank
-FROM files_fts
-JOIN files f ON f.rowid = files_fts.rowid
-WHERE files_fts MATCH '<keyword>'
-ORDER BY rank
-LIMIT 20;
+-- [intent] extract SubstrateEvaluateToon full body
+-- [budget] L1-E: g=3
+SELECT length(block_content_full) AS full_len FROM v_enriched
+WHERE file_path = 'Shaders/Private/Substrate/SubstrateToonBSDF.ush'
+  AND block_content LIKE '%SubstrateEvaluateToon%'
+  AND depth_level = 1;
+-- If full_len ≥ 200 → extract. If <200 → split-signature, query next same-depth segment.
+
+SELECT block_content_full FROM v_enriched
+WHERE file_path = 'Shaders/Private/Substrate/SubstrateToonBSDF.ush'
+  AND depth_level = 1 AND start_offset = <from_EXTRACT>;
+-- ✓ goal: block_content_full returned complete function body. Stop.
 ```
 
-Narrow with AND, fallback with OR:
+That's it. 1 Frame + 3 queries (2 probes + 1 terminal) = 4 queries total for a single-file question. Multi-layer investigations scale linearly: ~3-4 queries per layer.
 
-```sql
-SELECT f.path, f.ext, rank
-FROM files_fts JOIN files f ON f.rowid = files_fts.rowid
-WHERE files_fts MATCH '<kw1> <kw2>'
-ORDER BY rank LIMIT 20;
+## §3 Abstraction Frame — Write Before ANY SQL
+
+**The Frame is mandatory. Skipping it is the #1 cause of budget waste.** Going straight to DISCOVER without a Frame fragments attention and collapses layers.
+
+### 3.1 Template
+
+```
+═══ A* BUDGET FRAME  #<N> ═══
+QUERY: <one sentence — what are we looking for>
+
+LAYERS:
+  <label>: <role description>
+    DISCOVER:      candidate files via FTS5 MATCH
+    TRACE_DEPS:    [optional] validate candidates via deps
+    EXTRACT:       read file structure map via v_enriched
+    EXTRACT_BLOCK: retrieve block_content_full → TERMINAL
+    NO:            anti-pattern (e.g. "no whole-file read")
 ```
 
-Extension-filtered:
+### 3.2 Rules
+
+1. Every layer = DISCOVER → (TRACE_DEPS when helpful) → EXTRACT → EXTRACT_BLOCK. **Never skip to EXTRACT_BLOCK without a PROBE first.**
+2. EXTRACT_BLOCK always uses `block_content_full`. `block_content` is for EXTRACT previews only.
+3. Total EXTRACT_BLOCK output ≤ 6000 chars per feature.
+4. **Budget annotation on EVERY query** — `[budget] L<N>-P/D/E: g=<N>` above each SQL. Use `-P` for probes (DISCOVER/EXTRACT), `-D` for TRACE_DEPS, `-E` for EXTRACT_BLOCK.
+5. Goal test: `block_content_full` returns complete target → stop. New question = new frame.
+6. **Pruning**: if h(n) too high (FTS5 rank >10, no LIKE hits) → downgrade (OR synonyms) or switch intent. Layer exceeds 12 queries → report unsearchable, move to next layer. Multi-layer investigations have independent budgets per layer; 40+ queries total is normal for full subsystem exploration.
+7. **TRACE_DEPS is a search accelerator**, not just a call-chain tool. Use when DISCOVER returns 2+ candidates. Skip only when deps table is empty or DISCOVER returned a single unambiguous hit.
+
+### 3.3 Budget tracking format
+
+```
+→ [budget] L1-P: g=1 — FTS5 MATCH 'SubstrateToonBSDF' → SubstrateToonBSDF.ush (rank -9.2)
+→ [budget] L1-E: g=2 — block_content_full depth=1 → 4821 bytes ✓
+```
+
+## §4 Four Canonical Templates
+
+Four templates. Variants exist for edge cases — keep the canonical shape as default.
+
+### 4.1 DISCOVER — find candidate files via FTS5
 
 ```sql
+-- [intent] <what we're hunting>
+-- [budget] L<N>-P: g=<N>
 SELECT f.path, rank
-FROM files_fts JOIN files f ON f.rowid = files_fts.rowid
-WHERE files_fts MATCH '<keyword>'
-  AND f.ext IN ('.py', '.ts', '.tsx')
-ORDER BY rank LIMIT 20;
+FROM files_fts, files f
+WHERE files_fts MATCH '{QUERY}'
+  AND files_fts.rowid = f.id
+  AND f.path NOT LIKE '%test%'
+ORDER BY rank LIMIT 15;
 ```
 
-Rank heuristic:
+`{QUERY}` = FTS5 terms (space-separated, boolean operators OK).
 
-| rank | meaning | next step |
+### 4.2 TRACE_DEPS — disambiguate candidates via dependency graph
+
+Deps are a **search accelerator**: use when DISCOVER returns 2+ candidates, or when you need to validate which file is the core target.
+
+**TRACE_DEPS is NOT a call-chain tracing tool.** If the user asks "trace how X calls Y," write a Frame with DISCOVER→EXTRACT→EXTRACT_BLOCK per layer. TRACE_DEPS answers "which of these 3 files is the real implementation?" — not "what is the full call chain." For deep cross-file tracing, use §6 Dependency Chain Tracing as a reference, not as your primary search strategy.
+
+```sql
+-- [intent] validate candidate via deps
+-- [budget] L<N>-D: g=<N>
+-- Upstream: what does this file import?
+SELECT f.path AS imported_file, d.depth
+FROM enrich_file_deps d JOIN files f ON f.id = d.dep_file_id
+WHERE d.file_id = (SELECT id FROM files WHERE path = '{FILE}')
+  AND d.direction = 'upstream'
+ORDER BY d.depth;
+
+-- Downstream: who imports this file?
+SELECT f.path AS importer, d.depth
+FROM enrich_file_deps d JOIN files f ON f.id = d.file_id
+WHERE d.dep_file_id = (SELECT id FROM files WHERE path = '{FILE}')
+  AND d.direction = 'downstream'
+ORDER BY d.depth;
+```
+
+`{FILE}` = candidate path from DISCOVER.
+
+**Heuristic interpretation:**
+
+| Signal | Meaning | Action |
 |---|---|---|
-| strongly negative | likely target | extract via v_enriched (Operator 2) |
-| moderately negative | plausible | add keywords or filter extension/path |
-| weak | noisy | change query terms or inspect coverage |
-| empty | no term match | try OR, synonym, or report absence |
+| Many downstream deps (depth=1) | Core module, likely correct target | Proceed to EXTRACT |
+| Few deps + high FTS5 rank | Leaf file; check upstream for real implementation | Switch to imported file |
+| Upstream deps match your intent | Target is the dependency, not this file | Switch layer to that file |
+| No deps (empty table) | Deps not enriched | Skip TRACE_DEPS, EXTRACT on top candidate |
 
-## Stay In SQL
+**Budget**: TRACE_DEPS costs g=+1 per step (upstream + downstream). Limit to `depth <= 2` — beyond that fan-out explodes.
 
-SQL-ManyThing is a **closed-loop query system**. Once you have established that the index covers a project (pre-flight confirms `files` count > 0, `v_enriched` has blocks), every subsequent question about that project must start with SQL. Do not switch to Hermes's generic code-search tools (code_search, code_extract, search_files, read_file) for needs the index already satisfies. FTS5 finds files by keyword, v_enriched extracts block content, enrich_file_refs traces imports. The only valid reason to leave SQL is evidence the index does not have (untracked files, stale index, cross-repo references, binary blobs).
-
-When you catch yourself reaching for code_search / code_extract / grep after a SQL query, stop and ask: "does the SQL index have this data?" If yes, the answer is FTS5 + v_enriched. If no, then — and only then — fall back.
-
-## Operator 2: v_enriched Block Extraction
-
-`v_enriched` is the default universal Phase 2 interface. Every row = one depth segment with pre-extracted `block_content` — no need for `instr` anchor hunting or `substr` offset guessing. FTS5 narrows the file, `v_enriched` gives the exact block.
-
-**Find blocks by keyword (replaces old anchor+substr):**
+**Raw refs** (use when resolved deps are sparse, common on C/C++):
 
 ```sql
-SELECT file_path, depth_level, start_offset, end_offset,
-       block_content
-FROM v_enriched
-WHERE block_content LIKE '%<keyword>%'
-  AND ext = '.tsx'
-LIMIT 20;
+-- [intent] raw #include strings — full coverage
+-- [budget] L<N>-D: g=<N>
+SELECT target_raw, line_num
+FROM enrich_file_refs
+WHERE file_id = (SELECT id FROM files WHERE path = '{FILE}')
+ORDER BY line_num;
 ```
 
-**Browse file structure by depth (depth=0 = file-level, depth=1 = top-level blocks):**
+### 4.3 EXTRACT — file structure map (PROBE before extraction)
 
 ```sql
-SELECT depth_level, start_offset, end_offset,
-       substr(block_content, 1, 120) AS preview
+-- [intent] <what layer this serves>
+-- [budget] L<N>-P: g=<N>
+SELECT depth_level, start_offset,
+       length(block_content) AS bytes,
+       length(block_content_full) AS full_bytes,
+       substr(block_content, 1, 100) AS preview
 FROM v_enriched
-WHERE file_path = '<target_path>'
+WHERE file_path = '{FILE}'
+  AND depth_level <= {N}
+ORDER BY depth_level, start_offset;
+```
+
+`{FILE}` = relative path from DISCOVER. `{N}` = max depth. Use `bytes` and `preview` to pick the right depth level and offset for EXTRACT_BLOCK.
+
+**Depth by language — check this before EXTRACT_BLOCK:**
+
+| Language family | depth=0 | depth=1 | depth=2 |
+|---|---|---|---|
+| Brace-based (JS,TS,Go,Rust,Java,C++,C#) | File envelope | **Full function body** | Nested blocks |
+| Indent-based (Python,Ruby,YAML) | File envelope | Signature only | **Function body** |
+
+- Brace: extract bodies at `depth=1`.
+- Python: extract bodies at `depth=2`. depth=1 is signatures only.
+- C++ `.ush` / `.usf` shader files: brace-based, depth=1 for function bodies.
+
+**Variant — find symbol across all files (EXPENSIVE, use only when FTS5 fails):**
+
+```sql
+-- [intent] find where <symbol> is defined (narrow with file_path when possible)
+SELECT file_path, depth_level, start_offset,
+       length(block_content_full) AS full_bytes,
+       substr(block_content, 1, 100) AS preview
+FROM v_enriched
+WHERE block_content LIKE '%{SYMBOL}%'
+  AND depth_level <= {N}
+ORDER BY depth_level, start_offset;
+```
+
+**⚠️ On >50K-file indexes, NEVER run this without a `file_path` filter — it scans the entire VIEW and can time out.**
+
+### 4.4 EXTRACT_BLOCK — terminal extraction
+
+```sql
+-- [intent] <extract body of function/method/class>
+-- [budget] L<N>-E: g=<N>
+SELECT block_content_full FROM v_enriched
+WHERE file_path = '{FILE}'
+  AND depth_level = {N}
+  AND start_offset = {OFFSET}
+LIMIT 1;
+```
+
+`{FILE}`, `{N}`, `{OFFSET}` all from EXTRACT probe. **Never guess offset.**
+
+**Variant — extract by symbol name (when offset unknown):**
+
+```sql
+-- [intent] <extract via name match>
+-- [budget] L<N>-E: g=<N>
+SELECT block_content_full FROM v_enriched
+WHERE file_path = '{FILE}'
+  AND block_content LIKE '%{SYMBOL}%'
+  AND depth_level = {N}
+ORDER BY start_offset LIMIT 1;
+```
+
+**After extraction, ALWAYS check `length(block_content_full)`.** If <200 bytes for a function you know is large → split-signature edge case.
+
+#### block_content vs block_content_full
+
+| Column | Scope | Use for |
+|---|---|---|
+| `block_content` | Immediate depth segment | EXTRACT previews only |
+| `block_content_full` | Full enclosing scope (to next same-or-shallower segment) | **EXTRACT_BLOCK — always** |
+
+`block_content_full` eliminates manual stitching. One query gets the complete body.
+
+Detect truncation without extracting: `scope_end_offset - start_offset > end_offset - start_offset` → `block_content_full` has more content.
+
+#### Split-signature edge case (~15% of large functions)
+
+**Two causes:**
+1. **Multi-line signatures** (Python params, TSX generics) — the def-line segment's `block_content_full` is only the signature.
+2. **Nested-brace split on large functions** — a function body with 4000+ bytes may span multiple depth=1 segments because inner brace-blocks also get indexed. `block_content_full` from the first depth=1 segment only reaches the next same-depth boundary.
+
+**Detection**: `full_bytes` from EXTRACT probe looks plausible (1000-3000 bytes) but the function should be larger — check if the depth=0 parent has much larger `full_bytes`, or if multiple adjacent depth=1 segments share the same function name prefix in their previews.
+
+**Workaround for nested-brace split**: use the depth=0 parent segment instead:
+```sql
+SELECT block_content_full FROM v_enriched
+WHERE file_path = '{FILE}'
+  AND depth_level = 0 AND start_offset = {PARENT_OFFSET};
+```
+
+**For multi-line signatures**:
+
+```sql
+-- Step 1: find the def line
+SELECT start_offset, length(block_content_full) AS full_len,
+       substr(block_content_full, 1, 80) AS head
+FROM v_enriched
+WHERE file_path = '{FILE}'
+  AND block_content LIKE '%def {FUNC}%'
+  AND depth_level = {N}
 ORDER BY start_offset;
+
+-- Step 2: if full_len < 200, get the NEXT same-depth segment
+SELECT block_content_full FROM v_enriched
+WHERE file_path = '{FILE}'
+  AND depth_level = {N}
+  AND start_offset = (
+    SELECT MIN(start_offset) FROM v_enriched ve2
+    WHERE ve2.file_path = v_enriched.file_path
+      AND ve2.depth_level = {N}
+      AND ve2.start_offset > {STEP1_OFFSET}
+  );
 ```
 
-**Zoom into a function/method body via FTS5 → v_enriched chain:**
+#### Escape hatch (very rare)
+
+When `block_content_full` is truncated by SQLite/transport limits despite correct offsets:
 
 ```sql
--- Step 1: FTS5 finds the file
-SELECT f.path FROM files_fts JOIN files f ON f.rowid = files_fts.rowid
-WHERE files_fts MATCH 'function AppLayout' AND f.path LIKE 'ui-tui/%';
-
--- Step 2: v_enriched extracts the block at the right depth
-SELECT depth_level, block_content
-FROM v_enriched
-WHERE file_path = 'ui-tui/src/components/appLayout.tsx'
-  AND block_content LIKE '%function AppLayout%';
-```
-
-**Check coverage:**
-
-```sql
-SELECT COUNT(*) AS total_rows,
-       SUM(CASE WHEN block_content = '' THEN 1 ELSE 0 END) AS empty_blocks,
-       SUM(CASE WHEN refs_to IS NOT NULL THEN 1 ELSE 0 END) AS has_refs_to,
-       SUM(CASE WHEN refs_from IS NOT NULL THEN 1 ELSE 0 END) AS has_refs_from
-FROM v_enriched;
-```
-
-v_enriched is a VIEW computed from `files` + `enrich_depth_segments` + `enrich_file_refs`. LEFT JOIN means rows exist even without refs. Run `enrich_depth_segments.py` + `enrich_file_refs.py` + `create_enriched_view.py` to populate.
-
-**Key rule**: v_enriched gives `block_content` for free — do NOT fall back to `instr(content, ...)` + `substr(content, offset, length)` when v_enriched is available. The VIEW already has exact boundaries. Manual anchor hunting is only acceptable when v_enriched is not built.
-
-**block_content truncation escape hatch (very large blocks)**: v_enriched's `block_content` may be truncated when function bodies exceed its column width. Detect this: if `length(block_content)` is suspiciously short for the (end_offset - start_offset) range, or if a function clearly extends beyond what `block_content` returned, retrieve the full body from `files.content` using v_enriched's exact offsets — never instr-based guessing:
-
-```sql
-SELECT substr(f.content, ve.start_offset, ve.end_offset - ve.start_offset) AS full_body
-FROM v_enriched ve
-JOIN files f ON f.id = ve.file_id
-WHERE ve.file_path = '<target_path>'
-  AND ve.depth_level = 1
-  AND ve.block_content LIKE '%<anchor_keyword>%';
-```
-
-This is NOT a violation of the anchor-hunting rule. The difference: v_enriched provides verified `start_offset`/`end_offset` from the depth-segment indexing pass; instr requires scanning content for a text anchor at query-time. Offset-based extraction from v_enriched boundaries is the correct A* g=1 escape hatch for oversized blocks.
-
-**Zoom out for broader context (don't guess offsets):** When a single block is too narrow, expand by lowering `depth_level` — v_enriched already knows the nesting hierarchy. Never fall back to blind `substr(content, <magic_number>, N)`:
-
-```sql
--- Step 1: browse the file's block map (depth=0 = file-level envelope)
-SELECT depth_level, start_offset, end_offset,
-       substr(block_content, 1, 120) AS preview
-FROM v_enriched
-WHERE file_path = '<path>'
-ORDER BY start_offset;
-
--- Step 2: get the enclosing scope (e.g. class body around a method)
-SELECT block_content FROM v_enriched
-WHERE file_path = '<path>'
-  AND depth_level = <target_depth - 1>
-  AND start_offset <= <target_start_offset>
-  AND end_offset >= <target_end_offset>;
-
--- Step 3 (rare): if you genuinely need raw bytes between blocks,
--- use v_enriched offsets — never guess:
-SELECT substr(f.content, ve.start_offset, ve.end_offset - ve.start_offset)
+SELECT substr(f.content, ve.start_offset + 1, ve.scope_end_offset - ve.start_offset)
 FROM v_enriched ve JOIN files f ON f.id = ve.file_id
-WHERE ve.file_path = '<path>'
-  AND ve.depth_level = <depth>
-  AND ve.start_offset = <known_offset>;
+WHERE ve.file_path = '{FILE}' AND ve.start_offset = {OFFSET};
 ```
 
-Key principle: the file is fully covered by depth segments — every byte belongs to some block. If `block_content` feels too small, the fix is lowering `depth_level`, not abandoning v_enriched for manual offset guessing. Manual `substr(content, 36637, 4000)` is an anti-pattern: the number 36637 appears nowhere in the query plan and was arrived at by guesswork.
+**This is the ONLY valid reason to leave v_enriched for raw files.content.** Offsets MUST come from v_enriched columns — never guess.
 
-## Operator 3: Import & Dependency Probe
+## §5 Full-Stack Example (4 layers, 8 queries)
 
-Use for "who imports X" or "what does X depend on" questions.
+```
+═══ A* BUDGET FRAME  #1 ═══
+QUERY: Dashboard TUI — how does the browser connect to the agent?
 
-**Raw imports (cross-language, no resolution needed):**
+LAYERS:
+  frontend:    xterm.js terminal + WebSocket client (ChatPage.tsx)
+  api:         /api/pty WebSocket endpoint (web_server.py)
+  backend:     PtyBridge PTY spawn (pty_bridge.py)
+  transport:   tui_gateway WSTransport (ws.py)
+```
+
+Layer 1 — frontend:
 
 ```sql
--- Find all files importing any variant of a class name
-SELECT f.path, r.target_raw, r.line_num
-FROM enrich_file_refs r JOIN files f ON f.id = r.file_id
-WHERE r.target_raw LIKE '%<ClassName>%'
+-- [intent] find xterm.js terminal component
+-- [budget] L1-P: g=1
+SELECT f.path, rank FROM files_fts, files f
+WHERE files_fts MATCH 'xterm Terminal ChatPage'
+  AND files_fts.rowid = f.id AND f.ext IN ('.ts','.tsx')
+  AND f.path NOT LIKE '%test%'
+ORDER BY rank LIMIT 15;
+
+-- [intent] extract ChatPage.tsx full component body
+-- [budget] L1-E: g=2
+SELECT block_content_full FROM v_enriched
+WHERE file_path = 'web/src/pages/ChatPage.tsx'
+  AND block_content LIKE '%function ChatPage%'
+  AND depth_level = 0
+ORDER BY start_offset LIMIT 1;
+-- ✓ result: xterm.js Terminal + WebSocket /api/pty + resize + clipboard (29441 bytes)
+```
+
+Layer 2 — API endpoint:
+
+```sql
+-- [intent] find /api/pty WebSocket handler
+-- [budget] L2-P: g=3
+SELECT file_path, depth_level, length(block_content) AS bytes,
+       substr(block_content, 1, 80) AS preview
+FROM v_enriched
+WHERE block_content LIKE '%async def pty_ws%'
+  AND depth_level = 0;
+
+-- [intent] extract pty_ws() full handler
+-- [budget] L2-E: g=4
+SELECT block_content_full FROM v_enriched
+WHERE file_path = 'hermes_cli/web_server.py'
+  AND block_content LIKE '%async def pty_ws%'
+  AND depth_level = 0
+ORDER BY start_offset LIMIT 1;
+-- ✓ result: pty_ws() — auth → accept → bridge.spawn → reader/writer loops (4303 bytes)
+```
+
+Layer 3 — backend:
+
+```sql
+-- [intent] find PtyBridge.spawn in pty_bridge.py
+-- [budget] L3-P: g=5
+SELECT file_path, depth_level, length(block_content) AS bytes
+FROM v_enriched
+WHERE block_content LIKE '%class PtyBridge%'
+  AND depth_level <= 1;
+
+-- [intent] extract spawn() full method body
+-- [budget] L3-E: g=6
+SELECT block_content_full FROM v_enriched
+WHERE file_path = 'hermes_cli/pty_bridge.py'
+  AND block_content LIKE '%def spawn%'
+  AND depth_level = 1
+ORDER BY start_offset LIMIT 1;
+-- ✓ result: PtyProcess.spawn() — TERM backfill → dimensions → return PtyBridge (1850 bytes)
+```
+
+Layer 4 — transport:
+
+```sql
+-- [intent] find tui_gateway WebSocket transport
+-- [budget] L4-P: g=7
+SELECT f.path, rank FROM files_fts, files f
+WHERE files_fts MATCH 'handle_ws tui_gateway'
+  AND files_fts.rowid = f.id AND f.path NOT LIKE '%test%'
+ORDER BY rank LIMIT 15;
+
+-- [intent] extract WSTransport full implementation
+-- [budget] L4-E: g=8
+SELECT block_content_full FROM v_enriched
+WHERE file_path = 'tui_gateway/ws.py'
+  AND block_content LIKE '%class WSTransport%'
+  AND depth_level = 1
+ORDER BY start_offset LIMIT 1;
+-- ✓ result: WSTransport — dispatch() → same handlers as Ink stdio
+```
+
+→ ✓ goal: block_content_full returns complete body for all 4 layers (8 queries total).
+
+## §6 Dependency Chain Tracing (Reference)
+
+For deep cross-file tracing, use `enrich_file_deps` and `enrich_file_refs`. For routine candidate disambiguation, use §4.2 TRACE_DEPS — this section is for complex multi-hop tracing.
+
+### Upstream deps (what does this file import?)
+
+```sql
+SELECT d.dep_file_id, f.path AS imported_file, d.depth
+FROM enrich_file_deps d
+JOIN files f ON f.id = d.dep_file_id
+WHERE d.file_id = (SELECT id FROM files WHERE path = '{FILE}')
+  AND d.direction = 'upstream'
+ORDER BY d.depth;
+```
+
+### Downstream deps (what imports this file?)
+
+```sql
+SELECT d.file_id, f.path AS importer, d.depth
+FROM enrich_file_deps d
+JOIN files f ON f.id = d.file_id
+WHERE d.dep_file_id = (SELECT id FROM files WHERE path = '{FILE}')
+  AND d.direction = 'downstream'
+ORDER BY d.depth;
+```
+
+### Cross-file references (symbol-level)
+
+```sql
+SELECT f.path, r.line_num, r.target_raw
+FROM enrich_file_refs r
+JOIN files f ON f.id = r.file_id
+WHERE r.target_file_id = (SELECT id FROM files WHERE path = '{FILE}')
 ORDER BY f.path, r.line_num;
 ```
 
-This works for all languages — Java `import org.neo4j.graphdb.Node`, Python `from foo.bar import Baz`, JS `import { X } from './module'`. Resolution to `target_file_id` is a bonus for languages with path-matching resolvers (Python, JS/TS, Go). Java and other languages with package→filesystem gaps fall back to fuzzy `target_raw` matching — by design.
+**BUG ALERT — JOIN direction**: upstream joins `files f ON f.id = d.dep_file_id` with `WHERE d.file_id = target`. Downstream joins `files f ON f.id = d.file_id` with `WHERE d.dep_file_id = target`. Swapping these gives empty results.
 
-**Transitive dependency tree (upstream + downstream):**
+**Coverage note**: On C/C++ projects, bare `#include "file.h"` patterns often fail path resolution. Basename fallback exists but resolved deps are always sparser than raw refs. `enrich_file_refs.target_raw` has full coverage; use it when resolved deps come up empty.
 
-```sql
--- Upstream: what files does this file import, transitively?
-SELECT f.path, d.depth
-FROM enrich_file_deps d JOIN files f ON f.id = d.dep_file_id
-WHERE d.file_id = (SELECT id FROM files WHERE path = '<target_path>')
-  AND d.direction = 'upstream'
-ORDER BY d.depth, f.path;
+## §7 Domain Knowledge Banks (references/)
 
--- Downstream: what files import this file, transitively?
-SELECT f.path, d.depth
-FROM enrich_file_deps d JOIN files f ON f.id = d.file_id
-WHERE d.dep_file_id = (SELECT id FROM files WHERE path = '<target_path>')
-  AND d.direction = 'downstream'
-ORDER BY d.depth, f.path;
-```
+Pre-indexed architectural summaries built from A* traversal. Load with `skill_view(name="sql-manything", file_path="references/<name>.md")` before querying a known domain — they cut discovery cost to near-zero.
 
-Coverage: deps only exist when `enrich_file_refs` has resolved refs. If empty, run `enrich_file_refs.py` then `flatten_file_deps.py`.
+See `references/INDEX.md` for full catalog.
 
-## Optional Enrichment: Symbols & Graphs
+## §8 Common Violations (Checklist)
 
-Tool-specific enrichment (cymbal symbols, graphify edges, UHT reflection, Java modules) coexists with universal Phase 2. These tables are optional and project-specific — query them when present, fall back to FTS5 + v_enriched when absent.
+If something goes wrong, scan this list before debugging:
 
-Symbol probe (cymbal, `file_enrich.symbols`): `references/phase2/enrich-cymbal.md`
-
-Graph probe (graphify, `enrich_graphify_*`): `references/phase2/enrich-graphify.md`
-
-UE UHT: `scripts/phase2/uht_enrich.py`
-
-Java modules: `scripts/phase2/enrich_java_build.py`
-
-## Query-Time References
-
-| Pattern | Reference |
-|---|---|
-| JS/TS library exploration | `references/query/library-analysis-js-ts.md` |
-| UE GAS AttributeSet BP init diagnosis | `references/query/ue-gas-attribute-analysis.md` |
-
-## Build-Time References
-
-| Topic | Reference |
-|---|---|---|
-| Phase 1 base FTS5 index | `scripts/phase1/manything_build_db.py` |
-| Phase 1 setup reference | `references/phase1/phase1-setup.md` |
-| Phase 1 extension rebuild | `references/phase1/phase1-rebuild-add-tsx.md` |
-| Phase 1 gitignore enumeration | `references/phase1/gitignore-enumeration.md` |
-| Universal Phase 2: depth/indent segments | `scripts/phase2/enrich_depth_segments.py` |
-| Universal Phase 2: file-level import refs | `scripts/phase2/enrich_file_refs.py` |
-| Universal Phase 2: transitive dep flattening | `scripts/phase2/flatten_file_deps.py` |
-| Universal Phase 2: v_enriched wide VIEW | `scripts/phase2/create_enriched_view.py` |
-| Universal Phase 2: Windows BAT template | `scripts/phase2/run_phase2_universal_windows.bat` |
-| Phase 2 performance patterns | `references/phase2/perf-optimization.md` |
-| Symbol enrichment (cymbal) | `references/phase2/enrich-cymbal.md` |
-| Graph enrichment (graphify) | `references/phase2/enrich-graphify.md` |
-| Java build enrichment | `references/phase2/enrich-java-build.md` |
-| UE UHT enrichment | `scripts/phase2/uht_enrich.py` |
-| Coverage checking | `references/phase2/enrich-covercheck-workflow.md` |
-| Debugging empty symbol output | `references/phase2/debug-cymbal-outline-empty.md` |
-| Unreal UHT generated files | `references/phase2/ue-uht-generated-files.md` |
-| Query log design | `references/phase3/phase3-design-rationale.md` |
-| Trace pre-flight debugging | `references/phase3/trace-preflight-debugging.md` |
-| Query log importer parsing | `references/phase3/importer-parsing.md` |
-| WSL-Windows Phase 1/2/3 smoke | `references/platforms/wsl-windows-phase123-smoke.md` |
-| Unreal installed-build indexing | `references/unreal/installed-build-indexing.md` |
-| Unreal indexing profiles | `references/unreal/unreal-installed-indexing-profiles.md` |
-| UE 5.8 full run | `references/unreal/ue58-full-phase123-run.md` |
-| Phase 2 overload test (UE) | `references/unreal/phase2-overload-test.md` |
-| Unreal UHT DB verification | `scripts/verify/verify_ue_uht_sql.py` |
-| Third-party licensing audit | `references/third-party-attribution.md` |
-| Open-source attribution notices | `THIRD_PARTY_NOTICES.md` |
-| Agent query-loop lessons | `references/agent-query-loop-lessons.md` |
-| Reference index | `references/INDEX.md` |
-| Design rationale | `references/design/sql-is-many-things.md` |
-| Contributing guide | `CONTRIBUTING.md` |
-| Changelog | `CHANGELOG.md` |
-| Security / privacy | `SECURITY.md` |
-| DB maintenance | `references/db-maintenance.md` |
-| Public examples | `references/public-examples.md` |
-
-## Core Schema
-
-| Table | Purpose |
-|---|---|
-| `files` | one row per indexed file: path, ext, size, mtime, content |
-| `files_fts` | FTS5 trigram index over path and content |
-| `v_enriched` | **Primary query surface.** VIEW: files + depth_segments → block_content + refs_to + refs_from. Columns: file_id, file_path, ext, depth_level, start_offset, end_offset, block_content, refs_to, refs_from |
-| `enrich_file_refs` | cross-file imports: file_id, target_raw, target_file_id, line_num |
-| `enrich_file_deps` | flattened transitive deps: (file_id, dep_file_id, direction, depth) |
-| `enrich_depth_segments` | brace/indent offset ranges: (file_id, depth_level, start_offset, end_offset) |
-| `file_enrich` | per-file enrichment cache, usually cymbal symbols as JSON |
-| `enrich_graphify_nodes` / `_edges` | optional: graphify AST/document nodes and edges |
-
-Constraints: `files.ext` includes leading dot (`.py`). Enrichment coverage bounded by Phase 1 extensions. VIEW LEFT JOINs — rows exist without refs.
-
-## Query-Time Decision Tree
-
-1. Run pre-flight.
-2. Reuse a tagged trace if available and relevant.
-3. FTS5 probe to discover candidate files (Operator 1).
-4. v_enriched to extract block content — `block_content LIKE '%<keyword>%'` or `file_path = '<target>'` ORDER BY `start_offset` (Operator 2).
-5. If the question is about imports/dependencies, use `enrich_file_refs` + `enrich_file_deps` (Operator 3).
-6. If optional enrichment exists (symbols, graph, UHT), probe it as a complement — fall back to FTS5 + v_enriched when absent.
-7. Stop after the extracted evidence answers the question. If a follow-up question arises, **stay in SQL** — convert it to another FTS5 + v_enriched round. Only leave SQL when the index provably lacks the needed data (untracked file types, stale index, cross-repo references).
-8. If evidence is absent, state what was queried and what coverage was checked.
-9. Never fall back from v_enriched to `instr`+`substr` guessing when the VIEW is built.
-
-## Implementation Overview Recipe
-
-For a broad implementation overview, do not enumerate every file. Use a bounded sequence:
-
-```bash
-SQL-ManyThing-query-log import
-sqlite3 :trace "
-WITH intent(term) AS (
-  VALUES ('files'), ('ext'), ('path'),
-         ('v_enriched'), ('depth_segments'), ('file_refs'),
-         ('file_enrich'), ('graph'), ('README'), ('src')
-)
-SELECT id, project, tag, note, substr(sql_text, 1, 180) AS sql_preview
-FROM query_trace
-WHERE project='<project>'
-  AND (tag IS NOT NULL OR EXISTS (
-    SELECT 1 FROM intent WHERE lower(sql_text) LIKE '%' || lower(term) || '%'
-  ))
-ORDER BY tag IS NULL, id DESC
-LIMIT 12;"
-sqlite3 /manything/<project>/source.db "SELECT COUNT(*) FROM files; SELECT ext, COUNT(*) FROM files GROUP BY ext ORDER BY COUNT(*) DESC;"
-sqlite3 /manything/<project>/source.db "SELECT substr(path,1,instr(path||'/', '/')-1) AS top, COUNT(*) FROM files GROUP BY top ORDER BY COUNT(*) DESC LIMIT 20;"
-sqlite3 /manything/<project>/source.db "SELECT COUNT(*) AS segments, MIN(depth_level), MAX(depth_level) FROM enrich_depth_segments;"
-sqlite3 /manything/<project>/source.db "SELECT COUNT(*) AS total, SUM(CASE WHEN block_content='' THEN 1 ELSE 0 END) AS empty, SUM(CASE WHEN refs_to IS NOT NULL THEN 1 ELSE 0 END) AS has_refs_to FROM v_enriched;"
-sqlite3 /manything/<project>/source.db "SELECT direction, COUNT(*) FROM enrich_file_deps GROUP BY direction;"
-sqlite3 /manything/<project>/source.db "SELECT COUNT(*) FROM file_enrich WHERE symbols IS NOT NULL AND symbols != '[]';"
-sqlite3 /manything/<project>/source.db "SELECT COUNT(*) FROM enrich_graphify_nodes; SELECT DISTINCT relation FROM enrich_graphify_edges LIMIT 20;"
-```
-
-Then choose at most 3-5 representative anchors and extract via v_enriched. Prefer manifests, README-style docs, and main entrypoints found via FTS5.
-
-
-Anti-patterns:
-
-- `grep -r` or recursive config search.
-- `SELECT path ... ORDER BY path` without `LIMIT` or grouping.
-- Direct `.srcidx/source.db` reads after virtual path is known.
-- Whole-file reads or `substr(content, 1, length(content))`.
-- Falling back from v_enriched to manual `instr`+`substr` anchor hunting.
-- Switching from SQL to code_search/code_extract/read_file after SQL has answered the first question. Follow-up questions stay in SQL.
-
-## Common Pitfalls
-
-1. Skipping pre-flight. Import pending logs and inspect tagged traces before new exploration.
-2. Querying `:trace` without import. Pending logs stay invisible.
-3. Reading whole files. Bounded extraction is mandatory.
-4. Forgetting the dot in `files.ext`. Use `.py`, not `py`.
-5. Falling back from `v_enriched.block_content` to `instr`+`substr` anchor hunting. The VIEW has exact boundaries — use it.
-6. Assuming `enrich_file_refs.target_file_id` must be non-NULL. Query `target_raw LIKE '%ClassName%'` for cross-language import discovery.
-7. Recursively grepping Hermes home to find project aliases. Use `~/.hermes/manything/aliases.sh`.
-8. Listing every source path for an overview. Group by top-level path first, drill into a subset.
-9. Switching from SQL to code_search/code_extract mid-session. The index has FTS5 + v_enriched for everything provenance the project needs. Reaching for generic search tools is a signal you forgot SQL covers it — rephrase the question as a FTS5 MATCH and a v_enriched block look-up.
-10. Writing `.bat` files from WSL with LF line endings or non-ASCII characters (em dashes, Unicode). Windows `cmd.exe` requires CRLF + pure ASCII. Always run `unix2dos` on `.bat` files authored in WSL. Avoid `%s` in inline Python strings inside `.bat` — `cmd.exe` interprets `%s` as variable expansion; use `%%s` or keep verification in separate sqlite3 calls.
-11. Falling back to blind `substr(content, <magic_number>, <magic_number>)` when v_enriched found the target but you want «more context». The file is fully depth-segmented — every byte belongs to some block. If a single block feels too narrow, query `depth_level - 1` for the enclosing scope, or browse adjacent blocks by `start_offset`. Never fabricate a byte offset from thin air; always derive it from a v_enriched `start_offset`/`end_offset` column.
-
-## Verification Checklist
-
-Before answering:
-
-- [ ] Pre-flight ran or was explicitly impossible.
-- [ ] Query trace reuse was considered.
-- [ ] FTS5 probe ran with appropriate keyword expansion.
-- [ ] v_enriched used for block extraction — not `instr`+`substr` anchoring.
-- [ ] No whole-file `substr` was used.
-- [ ] Coverage checked: depth_segments, v_enriched, file_deps, optional enrichment.
-- [ ] Missing results include the query and coverage checked.
-- [ ] Final answer separates evidence from inference.
-
-Before editing this skill:
-
-- [ ] Keep `SKILL.md` generic and English-only.
-- [ ] Move build-time or project-specific detail into `references/`.
-- [ ] Preserve mandatory pre-flight, bounded extraction, and coverage-check rules.
-- [ ] Validate frontmatter and file size.
+1. **Skipping the Frame.** Write the Abstraction Frame before any SQL.
+2. **No budget annotation.** Every query needs `[budget] L<N>-P/D/E: g=<N>`.
+3. **Using `block_content` for EXTRACT_BLOCK.** Use `block_content_full`.
+4. **Blind `substr(content, N, M)`.** Offsets only from v_enriched columns.
+5. **`path LIKE` for function names.** Symbols live in `block_content`.
+6. **depth=1 for Python bodies.** Use depth=2; depth=1 is signature only.
+7. **Skip PROBE → straight to EXTRACT_BLOCK.** Always DISCOVER/EXTRACT first.
+8. **`read_file` after EXTRACT_BLOCK returned content.** block_content is the answer.
+9. **Wrapping SQL in execute_code/Python.** `sqlite3` CLI is the transport.
+10. **Stitching depth segments manually.** `block_content_full` spans levels.
+11. **Confusing layer budget with investigation budget.** >12 queries per layer = unsearchable. Multi-layer investigations have independent budgets per layer.
+12. **Not checking `length(block_content_full)`.** <200 bytes = classic split-signature. But **also** watch for 1000-3000 bytes on a known-large function — nested-brace split means the depth=0 parent may have 2×+ the content. Always cross-check `full_bytes` against the EXTRACT preview's expected scope.
+13. **Accepting degraded `block_content_full` silently.** Check `scope_end_offset IS NULL` if consistently truncated.
+14. **Only checking deps for call chains.** TRACE_DEPS is a search accelerator — use whenever DISCOVER returns 2+ candidates.
+15. **Broad `block_content LIKE` without `file_path` filter on large indexes.** >50K files: always narrow with file_path from DISCOVER.
+16. **FTS5 query with dots or special chars.** FTS5 syntax errors on `.` in search terms (e.g. `MATCH '"file" query.ush'`). Drop dots or use LIKE on pre-filtered files instead.
+17. **Old table remnants from previous buggy versions.** Before re-running Phase 2, check `sqlite_master` for `file_enrich`, `file_enrich_blocks`, `file_enrich_xref` — these are old-format tables that won't be cleaned up by the new scripts and will clutter inspection output. Drop them first (see §1.0).
